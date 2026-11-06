@@ -109,15 +109,24 @@ cv.addEventListener('pointerup', e => {
   const tap = !sw.moved; sw = null;
   if (!tap) return;
   const r = cv.getBoundingClientRect();
+  const lx = (e.clientX - r.left) / r.width * W, ly = (e.clientY - r.top) / r.height * H;
   if (state === 'menu') {
-    const lx = (e.clientX - r.left) / r.width * W, ly = (e.clientY - r.top) / r.height * H;
     if (ly > 175 && ly < 350 && lx < W / 3) { onKey('ArrowLeft'); return; }
     if (ly > 175 && ly < 350 && lx > W * 2 / 3) { onKey('ArrowRight'); return; }
     if (ly > 421 && ly < 443) { onKey('KeyN'); return; }
   }
+  if (state === 'pause' && inBtn(lx, ly, PAUSE_MENU_Y)) { goMenu(); return; }
+  if (state === 'over' && overT > 0.7 && inBtn(lx, ly, OVER_MENU_Y)) { goMenu(); return; }
   if (state !== 'play') onKey('Space');
 });
 cv.addEventListener('pointercancel', e => { if (sw && e.pointerId === sw.id) sw = null; });
+
+// выход в главное меню (с паузы или после финиша); пройденное с паузы идёт в рекорд
+function goMenu() {
+  if (state === 'pause' && dist > best) { best = dist; store.set('n7_best', best.toFixed(2)); }
+  state = 'menu'; browse = paintIdx; boosting = false; sw = null;
+  sfx(520, 0.06, 'triangle', 0.04);
+}
 
 // три фиксированных положения: одно нажатие — одна полоса
 function changeLane(step) {
@@ -130,6 +139,9 @@ function onKey(code) {
   if (state === 'play' && (code === 'ArrowLeft' || code === 'KeyA')) { changeLane(-1); return; }
   if (state === 'play' && (code === 'ArrowRight' || code === 'KeyD')) { changeLane(1); return; }
   if (code === 'KeyM') { muted = !muted; store.set('n7_muted', muted ? '1' : '0'); return; }
+  if ((code === 'KeyQ' || code === 'Backspace' || (code === 'Escape' && state === 'over')) && (state === 'pause' || (state === 'over' && overT > 0.7))) {
+    goMenu(); return;
+  }
   if ((code === 'KeyP' || code === 'Escape') && (state === 'play' || state === 'pause')) {
     state = state === 'play' ? 'pause' : 'play'; return;
   }
@@ -500,6 +512,26 @@ function text(s, y, font, col = '#ffffff') {
   ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic'; ctx.font = font; ctx.fillStyle = col; ctx.fillText(s, W / 2, y);
 }
 
+const BTN_W = 240, BTN_H = 44, PAUSE_MENU_Y = 386, OVER_MENU_Y = 476;
+const inBtn = (lx, ly, y) => Math.abs(lx - W / 2) < BTN_W / 2 && ly > y - 4 && ly < y + BTN_H + 4;
+function button(label, y, primary, alpha = 1) {
+  const x = W / 2 - BTN_W / 2;
+  ctx.save(); ctx.globalAlpha = alpha;
+  ctx.fillStyle = primary ? '#ffe14d' : 'rgba(22,70,72,.95)'; rr(x, y, BTN_W, BTN_H, 12); ctx.fill();
+  if (!primary) { ctx.strokeStyle = 'rgba(143,201,196,.75)'; ctx.lineWidth = 1.5; rr(x, y, BTN_W, BTN_H, 12); ctx.stroke(); }
+  ctx.fillStyle = primary ? '#0b2426' : '#e8f6f4'; ctx.font = 'bold 17px Segoe UI';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText(label, W / 2, y + BTN_H / 2 + 1);
+  ctx.restore();
+}
+
+function drawPausePanel() {
+  panel(250, 250);
+  text('ПАУЗА', 302, 'bold 32px Segoe UI');
+  button('▶  Продолжить', 330, true);
+  button('Главное меню', PAUSE_MENU_Y, false);
+  text('P — продолжить · Q — в меню', 466, '13px Segoe UI', '#8fc9c4');
+}
+
 function drawMenu() {
   panel(66, 450);
   text('NISSAN N7', 122, 'bold 40px Segoe UI', '#7fe0d8');
@@ -518,7 +550,7 @@ function drawMenu() {
     ['↑  или  W', 'ускориться'],
     ['↓  или  S', 'тормоз = рекуперация'],
     ['N', 'время суток: ' + NIGHT_MODES[nightMode]],
-    ['P / Esc', 'пауза,  M — звук'],
+    ['P / Esc', 'пауза,  Q — меню,  M — звук'],
   ];
   ctx.font = '600 14px Segoe UI'; ctx.textBaseline = 'alphabetic';
   lines.forEach(([k, v], i) => {
@@ -533,7 +565,7 @@ function drawMenu() {
 }
 
 function drawOver() {
-  panel(180, 300);
+  panel(180, 360);
   const crash = overReason === 'crash';
   text(crash ? 'АВАРИЯ!' : 'БАТАРЕЯ НА НУЛЕ', 236, 'bold 32px Segoe UI', crash ? '#ff6b5b' : '#ffc93c');
   text(crash ? 'Хорошо, что есть КАСКО.' : 'Эвакуатор уже выехал…', 266, '15px Segoe UI', '#d8f3f0');
@@ -541,7 +573,9 @@ function drawOver() {
   if (newRecord) text('НОВЫЙ РЕКОРД!', 366, 'bold 18px Segoe UI', '#5cf2a6');
   else text('Рекорд: ' + best.toFixed(1) + ' км', 366, '600 15px Segoe UI', '#8fc9c4');
   if (unlockedNow.length) text('В гараже новый цвет: ' + unlockedNow.join(', '), 400, 'bold 14px Segoe UI', '#ffe14d');
-  if (overT > 0.7 && Math.floor(time * 2) % 2 === 0) text('ПРОБЕЛ или касание — ещё раз', 440, 'bold 17px Segoe UI', '#ffe14d');
+  const ready = overT > 0.7 ? 1 : 0.35;
+  button('Ещё раз', 422, true, ready);
+  button('Главное меню', OVER_MENU_Y, false, ready);
 }
 
 // ---------- Ночь: тёмный слой, из которого «вырезаны» фары и фонари ----------
@@ -634,7 +668,7 @@ function draw() {
   if (state === 'menu') drawMenu();
   else {
     drawHUD();
-    if (state === 'pause') { panel(280, 130); text('ПАУЗА', 335, 'bold 32px Segoe UI'); text('Касание, P или пробел — продолжить', 375, '15px Segoe UI', '#d8f3f0'); }
+    if (state === 'pause') drawPausePanel();
     if (state === 'over') drawOver();
   }
 }

@@ -78,11 +78,19 @@ addEventListener('keyup', e => keys[e.code] = false);
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; if (state === 'play') state = 'pause'; });
 // касания: свайп влево/вправо — смена полосы (и цвета в гараже), простое касание — кнопки и старт
 const SWIPE_PX = 28;            // сколько экранных пикселей провести пальцем для одного шага
-let sw = null;
+const HOLD_MS = 180;            // удержание пальца дольше этого — газ
+const PAUSE_BTN = { x: W - 34, y: 98, r: 20 };
+let sw = null, boosting = false;
+const touchBoost = () => state === 'play' && !!sw && !sw.done && performance.now() - sw.t0 > HOLD_MS;
 cv.addEventListener('pointerdown', e => {
   e.preventDefault();
   if (sw) return;               // второй палец игнорируем
-  sw = { id: e.pointerId, x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: false };
+  const r = cv.getBoundingClientRect();
+  const lx = (e.clientX - r.left) / r.width * W, ly = (e.clientY - r.top) / r.height * H;
+  if ((state === 'play' || state === 'pause') && Math.hypot(lx - PAUSE_BTN.x, ly - PAUSE_BTN.y) < PAUSE_BTN.r + 12) {
+    onKey('KeyP'); return;      // кнопка паузы
+  }
+  sw = { id: e.pointerId, x: e.clientX, y: e.clientY, x0: e.clientX, y0: e.clientY, moved: false, t0: performance.now() };
   try { cv.setPointerCapture(e.pointerId); } catch (err) { }
 });
 cv.addEventListener('pointermove', e => {
@@ -176,7 +184,7 @@ function reset() {
   P = { x: laneX(1), y: H - 120, vx: 0, lane: 1 };
   objs = []; fx = []; texts = [];
   kmh = 70; dist = 0; batt = 100; rowAcc = 0; freeSet = [0, 1, 2];
-  shake = 0; regenOn = false; braking = false; flash = 0; sinceCharger = 0; lowBeep = 0; newRecord = false;
+  shake = 0; regenOn = false; braking = false; boosting = false; flash = 0; sinceCharger = 0; lowBeep = 0; newRecord = false;
 }
 reset();
 
@@ -225,7 +233,8 @@ function gameOver(reason) {
 function update(dt) {
   const d = Math.min(1, dist / 40);                // сложность растёт первые 40 км
   const cruise = 75 + 45 * d;
-  const U = keys.ArrowUp || keys.KeyW, Dn = keys.ArrowDown || keys.KeyS;
+  const U = keys.ArrowUp || keys.KeyW || touchBoost(), Dn = keys.ArrowDown || keys.KeyS;
+  boosting = U && !Dn;
   let target = cruise;
   if (U) target = cruise + 30;
   if (Dn) target = Math.max(30, cruise * 0.4);
@@ -455,8 +464,8 @@ function drawHUD() {
   // скорость
   ctx.textAlign = 'center'; ctx.fillStyle = '#ffffff'; ctx.font = 'bold 28px Segoe UI';
   ctx.fillText(Math.round(kmh), W / 2 + 4, 44);
-  ctx.font = '600 10px Segoe UI'; ctx.fillStyle = regenOn ? '#5cf2a6' : '#8fc9c4';
-  ctx.fillText(regenOn ? 'РЕКУПЕРАЦИЯ' : 'км/ч', W / 2 + 4, 59);
+  ctx.font = '600 10px Segoe UI'; ctx.fillStyle = regenOn ? '#5cf2a6' : boosting ? '#ffe14d' : '#8fc9c4';
+  ctx.fillText(regenOn ? 'РЕКУПЕРАЦИЯ' : boosting ? 'УСКОРЕНИЕ' : 'км/ч', W / 2 + 4, 59);
   // батарея
   const bx = W - 128, by = 18, bw = 92, bh = 26;
   ctx.strokeStyle = '#cfe9e6'; ctx.lineWidth = 2; rr(bx, by, bw, bh, 5); ctx.stroke();
@@ -468,6 +477,19 @@ function drawHUD() {
   ctx.fillStyle = '#8fc9c4'; ctx.font = '600 10px Segoe UI';
   ctx.fillText('запас ≈ ' + Math.round(batt / 100 * RANGE_KM) + ' км', bx + bw / 2, by + 39);
   if (muted) { ctx.textAlign = 'left'; ctx.fillStyle = '#8fc9c4'; ctx.fillText('звук выкл (M)', 14, H - 12); }
+  if (state === 'play' || state === 'pause') drawPauseButton();
+}
+
+function drawPauseButton() {
+  const { x, y, r } = PAUSE_BTN;
+  ctx.fillStyle = 'rgba(6,18,20,.78)'; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+  ctx.strokeStyle = 'rgba(143,201,196,.7)'; ctx.lineWidth = 1.5; ctx.stroke();
+  ctx.fillStyle = '#e8f6f4';
+  if (state === 'pause') {          // «продолжить»
+    ctx.beginPath(); ctx.moveTo(x - 5, y - 8); ctx.lineTo(x + 8, y); ctx.lineTo(x - 5, y + 8); ctx.closePath(); ctx.fill();
+  } else {
+    rr(x - 7, y - 8, 5, 16, 1.5); ctx.fill(); rr(x + 2, y - 8, 5, 16, 1.5); ctx.fill();
+  }
 }
 
 function panel(y, h) {
@@ -505,7 +527,7 @@ function drawMenu() {
     ctx.textAlign = 'left'; ctx.fillStyle = '#d8f3f0'; ctx.fillText(v, W / 2 + 8, y);
   });
   text('Собирай ⚡ и зарядки, объезжай машины и ямы.', 482, '13px Segoe UI', '#a9d6d1');
-  text('Телефон: свайп влево / вправо — смена полосы.', 500, '13px Segoe UI', '#a9d6d1');
+  text('Телефон: свайп ← → — полоса, держи палец — газ.', 500, '13px Segoe UI', '#a9d6d1');
   if (Math.floor(time * 2) % 2 === 0) text('ПРОБЕЛ или касание — поехали!', 556, 'bold 18px Segoe UI', '#ffe14d');
   if (best > 0) text('Рекорд: ' + best.toFixed(1) + ' км', 586, '600 14px Segoe UI', '#8fc9c4');
 }
@@ -612,7 +634,7 @@ function draw() {
   if (state === 'menu') drawMenu();
   else {
     drawHUD();
-    if (state === 'pause') { panel(280, 130); text('ПАУЗА', 335, 'bold 32px Segoe UI'); text('P или пробел — продолжить', 375, '15px Segoe UI', '#d8f3f0'); }
+    if (state === 'pause') { panel(280, 130); text('ПАУЗА', 335, 'bold 32px Segoe UI'); text('Касание, P или пробел — продолжить', 375, '15px Segoe UI', '#d8f3f0'); }
     if (state === 'over') drawOver();
   }
 }

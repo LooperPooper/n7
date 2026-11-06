@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>N7: Дорога до зарядки</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b1719;overflow:hidden;font-family:"Segoe UI",system-ui,sans-serif}
+  #wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+  canvas{display:block;border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.55);touch-action:none}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="c"></canvas></div>
+<script>
+"use strict";
+// ---------- Константы ----------
+const W = 420, H = 720;                 // логический размер поля
+const RL = 60, RR = 360, LW = 100;       // дорога: левый/правый край, ширина полосы
+const laneX = i => RL + LW * (i + 0.5);
+const CAR_W = 44, CAR_H = 100;           // габарит N7 в пикселях (≈ 1.9 × 4.9 м)
+const PXK = 6;                           // пикселей в секунду на 1 км/ч
+const TRAFFIC_KMH = 40;                  // скорость попутного потока
+const KM_SCALE = 5;                      // «игровое» ускорение пробега
+const RANGE_KM = 520;                    // запас хода на 100% (73 кВт·ч)
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const lcv = document.createElement('canvas'), lctx = lcv.getContext('2d');   // слой ночной темноты
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  const s = Math.min(innerWidth / W, innerHeight / H) * 0.97;
+  cv.style.width = W * s + 'px'; cv.style.height = H * s + 'px';
+  cv.width = lcv.width = Math.round(W * s * dpr); cv.height = lcv.height = Math.round(H * s * dpr);
+  ctx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+  lctx.setTransform(s * dpr, 0, 0, s * dpr, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+// ---------- Утилиты ----------
+// хранилище может быть недоступно (встроенные страницы, приватный режим) — игра работает и без него
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) { } },
+};
+function rr(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = a => a[Math.random() * a.length | 0];
+function hash(n) { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); }
+function box(x, y, w, h) { return { l: x - w / 2, r: x + w / 2, t: y - h / 2, b: y + h / 2 }; }
+const overlap = (a, b) => a.l < b.r && a.r > b.l && a.t < b.b && a.b > b.t;
+
+// ---------- Звук ----------
+let ac = null, muted = store.get('n7_muted') === '1';
+function sfx(f, d = 0.1, type = 'square', v = 0.05, slide = 0, delay = 0) {
+  if (muted) return;
+  try {
+    ac = ac || new AudioContext();
+    const t = ac.currentTime + delay, o = ac.createOscillator(), g = ac.createGain();
+    o.type = type; o.frequency.setValueAtTime(f, t);
+    if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, f + slide), t + d);
+    g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+    o.connect(g).connect(ac.destination); o.start(t); o.stop(t + d + 0.02);
+  } catch (e) { }
+}
+
+// ---------- Ввод ----------
+const keys = {};
+addEventListener('keydown', e => {
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) e.preventDefault();
+  if (!keys[e.code]) onKey(e.code);
+  keys[e.code] = true;
+});
+addEventListener('keyup', e => keys[e.code] = false);
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; if (state === 'play') state = 'pause'; });
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const r = cv.getBoundingClientRect();
+  if (state === 'menu') {
+    const lx = (e.clientX - r.left) / r.width * W, ly = (e.clientY - r.top) / r.height * H;
+    if (ly > 175 && ly < 350 && lx < W / 3) { onKey('ArrowLeft'); return; }
+    if (ly > 175 && ly < 350 && lx > W * 2 / 3) { onKey('ArrowRight'); return; }
+    if (ly > 421 && ly < 443) { onKey('KeyN'); return; }
+  }
+  if (state !== 'play') { onKey('Space'); return; }
+  changeLane((e.clientX - r.left) < r.width / 2 ? -1 : 1);
+});
+
+// три фиксированных положения: одно нажатие — одна полоса
+function changeLane(step) {
+  if (state !== 'play') return;
+  const n = Math.max(0, Math.min(2, P.lane + step));
+  if (n !== P.lane) { P.lane = n; sfx(330, 0.04, 'triangle', 0.025); }
+}
+
+function onKey(code) {
+  if (state === 'play' && (code === 'ArrowLeft' || code === 'KeyA')) { changeLane(-1); return; }
+  if (state === 'play' && (code === 'ArrowRight' || code === 'KeyD')) { changeLane(1); return; }
+  if (code === 'KeyM') { muted = !muted; store.set('n7_muted', muted ? '1' : '0'); return; }
+  if ((code === 'KeyP' || code === 'Escape') && (state === 'play' || state === 'pause')) {
+    state = state === 'play' ? 'pause' : 'play'; return;
+  }
+  if (code === 'KeyN') { nightMode = (nightMode + 1) % NIGHT_MODES.length; store.set('n7_night', nightMode); return; }
+  if (state === 'menu' && ['ArrowLeft', 'ArrowRight', 'KeyA', 'KeyD'].includes(code)) {
+    const step = code === 'ArrowLeft' || code === 'KeyA' ? -1 : 1;
+    browse = (browse + step + PAINTS.length) % PAINTS.length;
+    if (unlocked(browse)) { paintIdx = browse; store.set('n7_paint', paintIdx); }
+    sfx(unlocked(browse) ? 620 : 240, 0.06, 'triangle', 0.04);
+    return;
+  }
+  if (code === 'Space' || code === 'Enter') {
+    if (state === 'menu' || (state === 'over' && overT > 0.7)) { browse = paintIdx; reset(); state = 'play'; sfx(440, 0.08, 'triangle', 0.05); sfx(660, 0.12, 'triangle', 0.05, 0, 0.08); }
+    else if (state === 'pause') state = 'play';
+  }
+}
+
+// ---------- Состояние ----------
+let state = 'menu', best = +(store.get('n7_best') || 0);
+let P, objs, fx, texts, kmh, dist, batt, scroll = 0, rowAcc, freeSet, time = 0, shake, overReason, overT = 0,
+  regenOn, braking, flash, sinceCharger, lowBeep, newRecord, unlockedNow = [];
+
+// ---------- Гараж: цвета кузова открываются рекордом ----------
+const PAINTS = [
+  { name: 'Аквамарин', d: '#0d4042', b: '#1d6d6f', l: '#47a7a2', need: 0 },
+  { name: 'Жемчужно-белый', d: '#9ea3a3', b: '#d9dcd9', l: '#ffffff', need: 3 },
+  { name: 'Графит', d: '#121416', b: '#30353a', l: '#6a7077', need: 6 },
+  { name: 'Полночный синий', d: '#0b1736', b: '#1d3674', l: '#4f73c4', need: 10 },
+  { name: 'Рубиновый', d: '#4d0a10', b: '#9c1520', l: '#e0444c', need: 15, cal: '#f2c230' },
+  { name: 'Песочное золото', d: '#5e4a22', b: '#a88443', l: '#e6c88a', need: 20 },
+  { name: 'Сумеречный фиолет', d: '#24143a', b: '#4f3380', l: '#9c7ad1', need: 30 },
+];
+const unlocked = i => best >= PAINTS[i].need;
+let paintIdx = Math.min(PAINTS.length - 1, +(store.get('n7_paint') || 0));
+if (!unlocked(paintIdx)) paintIdx = 0;
+let browse = paintIdx;
+
+// ---------- Время суток ----------
+const NIGHT_MODES = ['авто', 'всегда день', 'всегда ночь'];
+let nightMode = +(store.get('n7_night') || 0) % NIGHT_MODES.length;
+const NIGHT_MAX = 0.86;
+function darkness() {
+  if (nightMode === 1) return 0;
+  if (nightMode === 2) return NIGHT_MAX;
+  if (state === 'menu') return 0;
+  const p = dist % 12;   // 0–5 км день, 5–6.5 закат, 6.5–10.5 ночь, 10.5–12 рассвет
+  const v = p < 5 ? 0 : p < 6.5 ? (p - 5) / 1.5 : p < 10.5 ? 1 : 1 - (p - 10.5) / 1.5;
+  return v * NIGHT_MAX;
+}
+
+function reset() {
+  P = { x: laneX(1), y: H - 120, vx: 0, lane: 1 };
+  objs = []; fx = []; texts = [];
+  kmh = 70; dist = 0; batt = 100; rowAcc = 0; freeSet = [0, 1, 2];
+  shake = 0; regenOn = false; braking = false; flash = 0; sinceCharger = 0; lowBeep = 0; newRecord = false;
+}
+reset();
+
+const TRAFFIC = ['#c9ccd1', '#eeeeee', '#24272b', '#b3262b', '#2a4d8f', '#d9a21e', '#6b6f74', '#7a3e8f', '#e9e4d8'];
+
+function spawnRow(d, gap) {
+  // свободная полоса — соседняя с прошлой свободной, чтобы проезд всегда был реальным
+  const cand = [0, 1, 2].filter(l => freeSet.some(f => Math.abs(f - l) <= 1));
+  const F = pick(cand);
+  const others = [0, 1, 2].filter(l => l !== F).sort(() => Math.random() - 0.5);
+  const blocked = Math.random() < 0.25 + 0.45 * d ? others : [others[0]];
+  for (const l of blocked) {
+    const van = Math.random() < 0.15;
+    const h = van ? 116 : 96;
+    objs.push({ t: 'car', moving: true, x: laneX(l) + rnd(-6, 6), y: -h / 2 - 10, w: van ? 46 : 42, h, van,
+      col: van ? '#f1f1ee' : pick(TRAFFIC), blink: Math.random() < 0.1 });
+  }
+  freeSet = [0, 1, 2].filter(l => !blocked.includes(l));
+  const fl = pick(freeSet);
+  const needCharge = sinceCharger > (batt < 40 ? 2.2 : 5.5);
+  if (needCharge && Math.random() < 0.55) {
+    objs.push({ t: 'charger', x: laneX(fl), y: -60 - gap * 0.5, w: 84, h: 64 }); sinceCharger = 0;
+  } else if (Math.random() < 0.45) {
+    objs.push({ t: 'bolt', moving: true, x: laneX(fl), y: -70, w: 30, h: 30, ph: Math.random() * 6 });
+  }
+  if (Math.random() < 0.2 + 0.25 * d) {
+    objs.push({ t: 'hole', x: laneX(Math.random() * 3 | 0) + rnd(-22, 22), y: -60 - gap * 0.5, w: 38, h: 24, rot: rnd(-0.4, 0.4) });
+  }
+}
+
+function addText(s, c, x = P.x, y = P.y - 70) { texts.push({ s, c, x, y, life: 1.1 }); }
+function burst(x, y, n, cols, sp = 220, size = 4) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, v = rnd(sp * 0.3, sp);
+    fx.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: rnd(0.4, 0.9), max: 0.9, c: pick(cols), s: rnd(size * 0.5, size) });
+  }
+}
+
+function gameOver(reason) {
+  state = 'over'; overReason = reason; overT = 0;
+  unlockedNow = PAINTS.filter(p => p.need > best && p.need <= dist).map(p => p.name);
+  if (dist > best) { best = dist; newRecord = true; store.set('n7_best', best.toFixed(2)); }
+}
+
+// ---------- Логика ----------
+function update(dt) {
+  const d = Math.min(1, dist / 40);                // сложность растёт первые 40 км
+  const cruise = 75 + 45 * d;
+  const U = keys.ArrowUp || keys.KeyW, Dn = keys.ArrowDown || keys.KeyS;
+  let target = cruise;
+  if (U) target = cruise + 30;
+  if (Dn) target = Math.max(30, cruise * 0.4);
+  braking = Dn;
+  kmh += (target - kmh) * Math.min(1, dt * (Dn ? 2.5 : U ? 1.2 : 1.0));
+
+  // рекуперация: при торможении часть энергии возвращается
+  regenOn = Dn && kmh > target + 3;
+  if (regenOn) batt = Math.min(100, batt + (kmh - target) * 0.035 * dt);
+
+  const px = kmh * PXK, tpx = TRAFFIC_KMH * PXK;
+  const dkm = kmh / 3600 * dt * KM_SCALE;
+  dist += dkm; sinceCharger += dkm;
+  batt -= dkm * 17 * (0.6 + 0.4 * (kmh / 80) ** 2);  // аэродинамика: быстрее — дороже
+  scroll += px * dt;
+
+  // перестроение: плавно едем к центру выбранной полосы (~0.15 с на полосу)
+  const dx = laneX(P.lane) - P.x;
+  const move = Math.sign(dx) * Math.min(Math.abs(dx), 700 * dt);
+  P.x += move;
+  P.vx += ((dt > 0 ? move / dt : 0) - P.vx) * Math.min(1, dt * 20);   // только для наклона кузова
+
+  // новые ряды препятствий
+  const gap = 360 - 110 * d;
+  rowAcc = Math.max(-150, rowAcc + (px - tpx) * dt);
+  if (rowAcc >= gap) { rowAcc -= gap; spawnRow(d, gap); }
+
+  for (const o of objs) o.y += (o.moving ? px - tpx : px) * dt;
+
+  // столкновения
+  const pb = box(P.x, P.y, CAR_W - 8, CAR_H - 14);
+  for (const o of objs) {
+    if (o.used) continue;
+    const ob = o.t === 'car' ? box(o.x, o.y, o.w * 0.86, o.h * 0.9) : box(o.x, o.y, o.w, o.h);
+    if (!overlap(pb, ob)) continue;
+    if (o.t === 'car') {
+      burst((P.x + o.x) / 2, (pb.t + ob.b) / 2, 50, ['#ffcc33', '#ff7a1a', '#ffffff', '#888'], 320, 5);
+      shake = 16; sfx(180, 0.6, 'sawtooth', 0.09, -150); sfx(70, 0.5, 'square', 0.06, -30);
+      gameOver('crash'); return;
+    }
+    o.used = true;
+    if (o.t === 'bolt') {
+      batt = Math.min(100, batt + 5); addText('+5% ⚡', '#ffe14d', o.x, o.y);
+      burst(o.x, o.y, 14, ['#ffe14d', '#fff6a8'], 160, 3); sfx(880, 0.12, 'triangle', 0.06, 500);
+    } else if (o.t === 'charger') {
+      batt = Math.min(100, batt + 30); flash = 0.6; addText('Зарядка +30%', '#5cf2a6');
+      burst(P.x, P.y, 30, ['#5cf2a6', '#c8ffe3', '#ffffff'], 200, 4);
+      [523, 659, 784, 1047].forEach((f, i) => sfx(f, 0.14, 'triangle', 0.05, 0, i * 0.07));
+    } else if (o.t === 'hole') {
+      kmh *= 0.72; batt = Math.max(0, batt - 2); shake = 7; addText('Яма! −2%', '#ff9b6b');
+      sfx(90, 0.18, 'square', 0.07, -40);
+    }
+  }
+  objs = objs.filter(o => o.y < H + 160 && o.y > -520 && !(o.used && o.t !== 'hole'));
+
+  // предупреждение о низком заряде
+  if (batt < 15) { lowBeep -= dt; if (lowBeep <= 0) { sfx(980, 0.08, 'square', 0.03); lowBeep = 1; } }
+  if (batt <= 0) { batt = 0; sfx(300, 0.7, 'sine', 0.07, -220); gameOver('battery'); }
+}
+
+function updateFx(dt) {
+  for (const p of fx) { p.x += p.vx * dt; p.y += p.vy * dt; p.vx *= 0.94; p.vy *= 0.94; p.life -= dt; }
+  fx = fx.filter(p => p.life > 0);
+  for (const t of texts) { t.y -= 50 * dt; t.life -= dt; }
+  texts = texts.filter(t => t.life > 0);
+  shake = Math.max(0, shake - dt * 30);
+  flash = Math.max(0, flash - dt);
+}
+
+// ---------- Рисование ----------
+let lamps = [];
+function drawWorld() {
+  ctx.fillStyle = '#2e5a37'; ctx.fillRect(-20, -20, W + 40, H + 40);
+  ctx.fillStyle = '#2a5332';
+  const st = scroll % 120;
+  for (let y = -120 + st; y < H; y += 120) ctx.fillRect(-20, y, W + 40, 60);
+  // обочины и асфальт
+  ctx.fillStyle = '#77736a'; ctx.fillRect(RL - 14, -20, 14, H + 40); ctx.fillRect(RR, -20, 14, H + 40);
+  ctx.fillStyle = '#3a3f44'; ctx.fillRect(RL, -20, RR - RL, H + 40);
+  ctx.fillStyle = 'rgba(255,255,255,.03)';
+  for (let y = -60 + (scroll % 60); y < H; y += 60) ctx.fillRect(RL, y, RR - RL, 2);
+  ctx.fillStyle = '#e9e9e2'; ctx.fillRect(RL + 4, -20, 4, H + 40); ctx.fillRect(RR - 8, -20, 4, H + 40);
+  const off = scroll % 90;
+  for (let i = 1; i < 3; i++) for (let y = -90 + off; y < H; y += 90) ctx.fillRect(RL + LW * i - 2, y, 4, 45);
+
+  // придорожный декор (детерминирован по координате мира)
+  lamps = [];
+  const SP = 64, k0 = Math.floor((scroll - H - 140) / SP), k1 = Math.floor((scroll + 140) / SP);
+  for (let k = k0; k <= k1; k++) {
+    const y = scroll - k * SP, h1 = hash(k), h2 = hash(k + 0.37), h3 = hash(k + 0.71);
+    const left = h2 < 0.5;
+    if (k % 9 === 0) { drawLamp(left ? RL - 8 : RR + 8, y, left); lamps.push({ x: left ? RL + 14 : RR - 14, y }); continue; }
+    if (h1 < 0.3) continue;
+    const x = left ? 8 + h3 * (RL - 40) : RR + 30 + h3 * (W - RR - 40);
+    if (h1 < 0.75) drawTree(x, y, 13 + h3 * 9); else drawBush(x, y);
+  }
+}
+function drawTree(x, y, r) {
+  ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.beginPath(); ctx.arc(x + 5, y + 6, r, 0, 7); ctx.fill();
+  ctx.fillStyle = '#1d4426'; ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill();
+  ctx.fillStyle = '#2f6b39'; ctx.beginPath(); ctx.arc(x - r * 0.25, y - r * 0.25, r * 0.65, 0, 7); ctx.fill();
+  ctx.fillStyle = '#4a8a4f'; ctx.beginPath(); ctx.arc(x - r * 0.4, y - r * 0.4, r * 0.28, 0, 7); ctx.fill();
+}
+function drawBush(x, y) {
+  ctx.fillStyle = '#3c7a3f';
+  for (const [dx, dy, r] of [[-6, 0, 7], [5, -2, 8], [0, 5, 6]]) { ctx.beginPath(); ctx.arc(x + dx, y + dy, r, 0, 7); ctx.fill(); }
+}
+function drawLamp(x, y, left) {
+  ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(x - 2 + 4, y + 4, 4, 4);
+  ctx.strokeStyle = '#9aa0a6'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + (left ? 22 : -22), y); ctx.stroke();
+  ctx.fillStyle = '#c8ccd0'; ctx.beginPath(); ctx.arc(x, y, 4, 0, 7); ctx.fill();
+  ctx.fillStyle = '#fff3c4'; rr(x + (left ? 18 : -26), y - 3, 8, 6, 2); ctx.fill();
+}
+
+function wheels(w, h, calipers, cal = '#e0232e') {
+  for (const sy of [-h * 0.31, h * 0.3]) for (const sx of [-1, 1]) {
+    const x = sx < 0 ? -w / 2 - 2 : w / 2 - 4;
+    ctx.fillStyle = '#0b0b0b'; rr(x, sy - 10, 6, 20, 2); ctx.fill();
+    if (calipers) { ctx.fillStyle = cal; ctx.fillRect(sx < 0 ? x + 4 : x, sy - 3, 2, 6); }
+  }
+}
+
+// Nissan N7 сверху: цвет из гаража, чёрная панорамная крыша, сквозные световые полосы, красные суппорты
+function drawN7(x, y, rot = 0, s = 1, brake = false, paint = PAINTS[paintIdx], locked = false) {
+  const w = CAR_W, h = CAR_H;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot); ctx.scale(s, s);
+  if (locked) ctx.filter = 'grayscale(1) brightness(0.45)';
+  const g = ctx.createRadialGradient(0, -h / 2 - 6, 4, 0, -h / 2 - 6, 70);
+  g.addColorStop(0, 'rgba(210,255,250,.22)'); g.addColorStop(1, 'rgba(210,255,250,0)');
+  ctx.fillStyle = g; ctx.fillRect(-70, -h / 2 - 76, 140, 76);
+  ctx.fillStyle = 'rgba(0,0,0,.38)'; rr(-w / 2 + 4, -h / 2 + 7, w, h, 14); ctx.fill();
+  wheels(w, h, true, paint.cal);
+  const bg = ctx.createLinearGradient(-w / 2, 0, w / 2, 0);
+  bg.addColorStop(0, paint.d); bg.addColorStop(0.22, paint.b); bg.addColorStop(0.5, paint.l);
+  bg.addColorStop(0.78, paint.b); bg.addColorStop(1, paint.d);
+  ctx.fillStyle = bg; rr(-w / 2, -h / 2, w, h, 14); ctx.fill();
+  // капот
+  ctx.strokeStyle = 'rgba(255,255,255,.16)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(-10, -h / 2 + 5); ctx.quadraticCurveTo(-8, -h / 2 + 16, -9, -h / 2 + 26);
+  ctx.moveTo(10, -h / 2 + 5); ctx.quadraticCurveTo(8, -h / 2 + 16, 9, -h / 2 + 26); ctx.stroke();
+  // стёкла и крыша
+  ctx.fillStyle = '#0b1416'; rr(-w / 2 + 5, -h / 2 + 27, w - 10, h - 45, 10); ctx.fill();
+  const gl = ctx.createLinearGradient(0, -h / 2 + 27, 0, -h / 2 + 42);
+  gl.addColorStop(0, 'rgba(140,200,210,.35)'); gl.addColorStop(1, 'rgba(140,200,210,0)');
+  ctx.fillStyle = gl; rr(-w / 2 + 7, -h / 2 + 28, w - 14, 14, 6); ctx.fill();
+  ctx.fillStyle = '#121d20'; rr(-w / 2 + 8, -h / 2 + 43, w - 16, h - 72, 6); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.07)'; ctx.fillRect(-w / 2 + 12, -h / 2 + 46, 4, h - 78);
+  // зеркала
+  ctx.fillStyle = paint.b;
+  ctx.beginPath(); ctx.ellipse(-w / 2 - 3, -h / 2 + 31, 4, 2.6, -0.3, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(w / 2 + 3, -h / 2 + 31, 4, 2.6, 0.3, 0, 7); ctx.fill();
+  // сквозная передняя световая полоса
+  ctx.shadowColor = '#bffffa'; ctx.shadowBlur = 8;
+  ctx.fillStyle = '#eafffd'; rr(-w / 2 + 6, -h / 2 + 2, w - 12, 2.5, 1); ctx.fill();
+  // задняя полоса
+  ctx.shadowColor = '#ff2a3a'; ctx.shadowBlur = brake ? 18 : 6;
+  ctx.fillStyle = brake ? '#ff5560' : '#d81f2e'; rr(-w / 2 + 5, h / 2 - 4.5, w - 10, brake ? 3.5 : 2.5, 1); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+function drawCar(o) {
+  const { w, h } = o;
+  ctx.save(); ctx.translate(o.x, o.y);
+  ctx.fillStyle = 'rgba(0,0,0,.33)'; rr(-w / 2 + 4, -h / 2 + 6, w, h, 10); ctx.fill();
+  wheels(w, h, false);
+  ctx.fillStyle = o.col; rr(-w / 2, -h / 2, w, h, o.van ? 6 : 11); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,.18)'; ctx.fillRect(-w / 2, -h / 2 + 8, 5, h - 16); ctx.fillRect(w / 2 - 5, -h / 2 + 8, 5, h - 16);
+  ctx.fillStyle = '#16202a';
+  if (o.van) { rr(-w / 2 + 5, -h / 2 + 14, w - 10, 14, 4); ctx.fill(); ctx.fillStyle = 'rgba(0,0,0,.08)'; ctx.fillRect(-w / 2 + 6, -h / 2 + 34, w - 12, h - 42); }
+  else {
+    rr(-w / 2 + 5, -h / 2 + 24, w - 10, 16, 5); ctx.fill();           // лобовое
+    rr(-w / 2 + 6, h / 2 - 28, w - 12, 11, 4); ctx.fill();            // заднее
+    ctx.fillStyle = 'rgba(255,255,255,.12)'; rr(-w / 2 + 7, -h / 2 + 42, w - 14, h - 72, 5); ctx.fill(); // крыша
+  }
+  ctx.fillStyle = '#fff6d0'; ctx.fillRect(-w / 2 + 3, -h / 2 + 1, 8, 3); ctx.fillRect(w / 2 - 11, -h / 2 + 1, 8, 3);
+  const on = !o.blink || Math.floor(time * 3) % 2 === 0;
+  ctx.fillStyle = o.blink ? (on ? '#ffb020' : '#7a4a10') : '#c41d2a';
+  ctx.fillRect(-w / 2 + 3, h / 2 - 4, 8, 3); ctx.fillRect(w / 2 - 11, h / 2 - 4, 8, 3);
+  ctx.restore();
+}
+
+function drawBolt(o) {
+  const b = Math.sin(time * 5 + o.ph) * 3;
+  ctx.save(); ctx.translate(o.x, o.y + b);
+  const g = ctx.createRadialGradient(0, 0, 2, 0, 0, 24);
+  g.addColorStop(0, 'rgba(255,230,80,.55)'); g.addColorStop(1, 'rgba(255,230,80,0)');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0, 0, 24, 0, 7); ctx.fill();
+  ctx.fillStyle = '#ffe14d'; ctx.strokeStyle = '#7a5b00'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(3, -14); ctx.lineTo(-8, 2); ctx.lineTo(-1, 2); ctx.lineTo(-4, 14); ctx.lineTo(8, -3); ctx.lineTo(1, -3); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+function drawCharger(o) {
+  ctx.save(); ctx.translate(o.x, o.y);
+  const pulse = 0.5 + 0.5 * Math.sin(time * 6);
+  ctx.shadowColor = '#3cf59a'; ctx.shadowBlur = 10 + pulse * 10;
+  ctx.fillStyle = '#119a62'; rr(-o.w / 2, -o.h / 2, o.w, o.h, 10); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = '#c9ffe4'; ctx.lineWidth = 2; ctx.setLineDash([6, 4]);
+  rr(-o.w / 2 + 4, -o.h / 2 + 4, o.w - 8, o.h - 8, 7); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 22px Segoe UI'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('⚡', 0, -8);
+  ctx.font = 'bold 11px Segoe UI'; ctx.fillText('ЗАРЯДКА', 0, 16);
+  ctx.restore();
+}
+
+function drawHole(o) {
+  ctx.save(); ctx.translate(o.x, o.y); ctx.rotate(o.rot);
+  ctx.fillStyle = '#2a2d30'; ctx.beginPath(); ctx.ellipse(0, 0, o.w / 2 + 3, o.h / 2 + 3, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = '#15171a'; ctx.beginPath(); ctx.ellipse(1, 1, o.w / 2 - 2, o.h / 2 - 2, 0, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(120,140,160,.35)'; ctx.beginPath(); ctx.ellipse(-4, -2, o.w / 4, o.h / 5, 0, 0, 7); ctx.fill();
+  ctx.restore();
+}
+
+function batteryColor(b) { return b > 50 ? '#3ee08a' : b > 20 ? '#ffc93c' : '#ff4b4b'; }
+
+function drawHUD() {
+  ctx.fillStyle = 'rgba(6,18,20,.78)'; rr(8, 8, W - 16, 60, 12); ctx.fill();
+  ctx.textBaseline = 'alphabetic';
+  // пробег
+  ctx.textAlign = 'left'; ctx.fillStyle = '#8fc9c4'; ctx.font = '600 10px Segoe UI';
+  ctx.fillText('ПРОБЕГ · рекорд ' + best.toFixed(1), 20, 26);
+  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 24px Segoe UI'; ctx.fillText(dist.toFixed(1) + ' км', 20, 55);
+  // скорость
+  ctx.textAlign = 'center'; ctx.fillStyle = '#ffffff'; ctx.font = 'bold 28px Segoe UI';
+  ctx.fillText(Math.round(kmh), W / 2 + 4, 44);
+  ctx.font = '600 10px Segoe UI'; ctx.fillStyle = regenOn ? '#5cf2a6' : '#8fc9c4';
+  ctx.fillText(regenOn ? 'РЕКУПЕРАЦИЯ' : 'км/ч', W / 2 + 4, 59);
+  // батарея
+  const bx = W - 128, by = 18, bw = 92, bh = 26;
+  ctx.strokeStyle = '#cfe9e6'; ctx.lineWidth = 2; rr(bx, by, bw, bh, 5); ctx.stroke();
+  ctx.fillStyle = '#cfe9e6'; ctx.fillRect(bx + bw + 1, by + 8, 4, 10);
+  const lowBlink = batt < 15 && Math.floor(time * 4) % 2 === 0;
+  ctx.fillStyle = lowBlink ? '#7a1c1c' : batteryColor(batt);
+  rr(bx + 3, by + 3, Math.max(0, (bw - 6) * batt / 100), bh - 6, 3); ctx.fill();
+  ctx.fillStyle = '#06201a'; ctx.font = 'bold 13px Segoe UI'; ctx.fillText(Math.ceil(batt) + '%', bx + bw / 2, by + 18);
+  ctx.fillStyle = '#8fc9c4'; ctx.font = '600 10px Segoe UI';
+  ctx.fillText('запас ≈ ' + Math.round(batt / 100 * RANGE_KM) + ' км', bx + bw / 2, by + 39);
+  if (muted) { ctx.textAlign = 'left'; ctx.fillStyle = '#8fc9c4'; ctx.fillText('звук выкл (M)', 14, H - 12); }
+}
+
+function panel(y, h) {
+  ctx.fillStyle = 'rgba(4,14,16,.82)'; rr(30, y, W - 60, h, 18); ctx.fill();
+  ctx.strokeStyle = 'rgba(80,190,180,.45)'; ctx.lineWidth = 1.5; rr(30, y, W - 60, h, 18); ctx.stroke();
+}
+function text(s, y, font, col = '#ffffff') {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic'; ctx.font = font; ctx.fillStyle = col; ctx.fillText(s, W / 2, y);
+}
+
+function drawMenu() {
+  panel(66, 450);
+  text('NISSAN N7', 122, 'bold 40px Segoe UI', '#7fe0d8');
+  text('Дорога до зарядки', 152, '600 18px Segoe UI', '#d8f3f0');
+  // гараж
+  const p = PAINTS[browse], ok = unlocked(browse);
+  drawN7(W / 2, 236, Math.sin(time * 1.5) * 0.06, 1.15, false, p, !ok);
+  if (!ok) text('🔒', 244, '28px Segoe UI Emoji');
+  ctx.fillStyle = '#ffe14d'; ctx.font = 'bold 26px Segoe UI'; ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center'; ctx.fillText('◄', 70, 236); ctx.fillText('►', W - 70, 236);
+  text(p.name + (ok && browse === paintIdx ? '  ✓' : ''), 322, 'bold 17px Segoe UI', ok ? '#ffffff' : '#8a9a98');
+  text(ok ? 'цвет ' + (browse + 1) + ' из ' + PAINTS.length + ' · ← → выбрать'
+          : 'откроется при рекорде ' + p.need + ' км', 341, '12px Segoe UI', ok ? '#8fc9c4' : '#ffb36b');
+  const lines = [
+    ['← →  или  A D', 'сменить полосу'],
+    ['↑  или  W', 'ускориться'],
+    ['↓  или  S', 'тормоз = рекуперация'],
+    ['N', 'время суток: ' + NIGHT_MODES[nightMode]],
+    ['P / Esc', 'пауза,  M — звук'],
+  ];
+  ctx.font = '600 14px Segoe UI'; ctx.textBaseline = 'alphabetic';
+  lines.forEach(([k, v], i) => {
+    const y = 370 + i * 22;
+    ctx.textAlign = 'right'; ctx.fillStyle = '#ffe14d'; ctx.fillText(k, W / 2 - 8, y);
+    ctx.textAlign = 'left'; ctx.fillStyle = '#d8f3f0'; ctx.fillText(v, W / 2 + 8, y);
+  });
+  text('Собирай ⚡, заезжай на зарядки, объезжай машины и ямы.', 482, '13px Segoe UI', '#a9d6d1');
+  text('Ночью ямы видно только в свете фар.', 500, '13px Segoe UI', '#a9d6d1');
+  if (Math.floor(time * 2) % 2 === 0) text('ПРОБЕЛ или касание — поехали!', 556, 'bold 18px Segoe UI', '#ffe14d');
+  if (best > 0) text('Рекорд: ' + best.toFixed(1) + ' км', 586, '600 14px Segoe UI', '#8fc9c4');
+}
+
+function drawOver() {
+  panel(180, 300);
+  const crash = overReason === 'crash';
+  text(crash ? 'АВАРИЯ!' : 'БАТАРЕЯ НА НУЛЕ', 236, 'bold 32px Segoe UI', crash ? '#ff6b5b' : '#ffc93c');
+  text(crash ? 'Хорошо, что есть КАСКО.' : 'Эвакуатор уже выехал…', 266, '15px Segoe UI', '#d8f3f0');
+  text(dist.toFixed(1) + ' км', 330, 'bold 44px Segoe UI', '#ffffff');
+  if (newRecord) text('НОВЫЙ РЕКОРД!', 366, 'bold 18px Segoe UI', '#5cf2a6');
+  else text('Рекорд: ' + best.toFixed(1) + ' км', 366, '600 15px Segoe UI', '#8fc9c4');
+  if (unlockedNow.length) text('В гараже новый цвет: ' + unlockedNow.join(', '), 400, 'bold 14px Segoe UI', '#ffe14d');
+  if (overT > 0.7 && Math.floor(time * 2) % 2 === 0) text('ПРОБЕЛ или касание — ещё раз', 440, 'bold 17px Segoe UI', '#ffe14d');
+}
+
+// ---------- Ночь: тёмный слой, из которого «вырезаны» фары и фонари ----------
+function lightCone(x, y, rot, off, len, w0, w1, a) {
+  lctx.save(); lctx.translate(x, y); lctx.rotate(rot); lctx.translate(0, off);
+  const g = lctx.createLinearGradient(0, 0, 0, -len);
+  g.addColorStop(0, `rgba(0,0,0,${a})`); g.addColorStop(0.6, `rgba(0,0,0,${a * 0.55})`); g.addColorStop(1, 'rgba(0,0,0,0)');
+  lctx.fillStyle = g; lctx.beginPath();
+  lctx.moveTo(-w0, 0); lctx.lineTo(w0, 0); lctx.lineTo(w1, -len); lctx.lineTo(-w1, -len); lctx.closePath(); lctx.fill();
+  lctx.restore();
+}
+function lightPool(x, y, r, a) {
+  const g = lctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, `rgba(0,0,0,${a})`); g.addColorStop(1, 'rgba(0,0,0,0)');
+  lctx.fillStyle = g; lctx.beginPath(); lctx.arc(x, y, r, 0, 7); lctx.fill();
+}
+function drawNight(dk) {
+  lctx.save(); lctx.setTransform(1, 0, 0, 1, 0, 0); lctx.clearRect(0, 0, lcv.width, lcv.height); lctx.restore();
+  lctx.globalCompositeOperation = 'source-over';
+  lctx.fillStyle = `rgba(3,7,20,${dk})`; lctx.fillRect(-20, -20, W + 40, H + 40);
+  lctx.globalCompositeOperation = 'destination-out';
+  for (const L of lamps) lightPool(L.x, L.y, 75, 0.7);
+  if (state !== 'menu') {
+    const rot = P.vx / 480 * 0.12;
+    lightCone(P.x, P.y, rot, -CAR_H / 2 + 2, 360, 20, 95, 0.75);   // ближний+дальний
+    lightCone(P.x, P.y, rot, -CAR_H / 2 + 2, 230, 16, 50, 0.9);
+    lightPool(P.x, P.y, 62, 0.45);
+    for (const o of objs) {
+      if (o.t === 'car') { lightCone(o.x, o.y, 0, -o.h / 2 + 2, 150, 15, 46, 0.7); lightPool(o.x, o.y + o.h / 2, 30, 0.35); }
+      else if (o.t === 'charger') lightPool(o.x, o.y, 75, 0.95);
+      else if (o.t === 'bolt') lightPool(o.x, o.y, 28, 0.9);
+    }
+  }
+  lctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(lcv, 0, 0, W, H);
+
+  // то, что светится само, — поверх темноты
+  const a = dk / NIGHT_MAX;
+  ctx.save(); ctx.globalAlpha = a;
+  ctx.shadowBlur = 12;
+  for (const L of lamps) { ctx.shadowColor = '#ffe9a8'; ctx.fillStyle = '#fff3c4'; ctx.fillRect(L.x - 4, L.y - 3, 8, 6); }
+  if (state !== 'menu') {
+    for (const o of objs) {
+      if (o.t !== 'car') continue;
+      const on = !o.blink || Math.floor(time * 3) % 2 === 0;
+      ctx.shadowColor = o.blink ? '#ffb020' : '#ff2030'; ctx.fillStyle = o.blink ? (on ? '#ffc040' : 'rgba(0,0,0,0)') : '#ff3a44';
+      ctx.fillRect(o.x - o.w / 2 + 3, o.y + o.h / 2 - 4, 8, 3); ctx.fillRect(o.x + o.w / 2 - 11, o.y + o.h / 2 - 4, 8, 3);
+      ctx.shadowColor = '#fff6d0'; ctx.fillStyle = '#fffbe8';
+      ctx.fillRect(o.x - o.w / 2 + 3, o.y - o.h / 2 + 1, 8, 3); ctx.fillRect(o.x + o.w / 2 - 11, o.y - o.h / 2 + 1, 8, 3);
+    }
+    if (!playerHidden()) {
+      ctx.translate(P.x, P.y); ctx.rotate(P.vx / 480 * 0.12);
+      ctx.shadowColor = '#bffffa'; ctx.fillStyle = '#eafffd'; ctx.fillRect(-CAR_W / 2 + 6, -CAR_H / 2 + 2, CAR_W - 12, 2.5);
+      ctx.shadowColor = '#ff2a3a'; ctx.shadowBlur = braking ? 20 : 10;
+      ctx.fillStyle = braking ? '#ff5560' : '#e02434'; ctx.fillRect(-CAR_W / 2 + 5, CAR_H / 2 - 4.5, CAR_W - 10, braking ? 3.5 : 2.5);
+    }
+  }
+  ctx.restore();
+}
+const playerHidden = () => state === 'over' && overReason === 'crash' && overT > 0.15 && Math.floor(overT * 10) % 2;
+
+function draw() {
+  ctx.save();
+  if (shake > 0) ctx.translate(rnd(-shake, shake) / 2, rnd(-shake, shake) / 2);
+  drawWorld();
+  if (state !== 'menu') {
+    for (const o of objs) if (o.t === 'hole') drawHole(o);
+    for (const o of objs) if (o.t === 'charger') drawCharger(o);
+    for (const o of objs) if (o.t === 'car') drawCar(o);
+    for (const o of objs) if (o.t === 'bolt') drawBolt(o);
+    if (!playerHidden()) drawN7(P.x, P.y, P.vx / 480 * 0.12, 1, braking);
+  }
+  const dk = darkness();
+  if (dk > 0.01) drawNight(dk);
+  for (const p of fx) { ctx.globalAlpha = Math.max(0, p.life / p.max); ctx.fillStyle = p.c; ctx.fillRect(p.x - p.s / 2, p.y - p.s / 2, p.s, p.s); }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const t of texts) {
+    ctx.globalAlpha = Math.min(1, t.life * 2); ctx.font = 'bold 18px Segoe UI';
+    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0,0,0,.6)'; ctx.strokeText(t.s, t.x, t.y);
+    ctx.fillStyle = t.c; ctx.fillText(t.s, t.x, t.y);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  if (flash > 0) { ctx.fillStyle = `rgba(92,242,166,${flash * 0.35})`; ctx.fillRect(0, 0, W, H); }
+  if (state !== 'menu' && batt < 15 && Math.floor(time * 4) % 2 === 0) {
+    ctx.strokeStyle = 'rgba(255,60,60,.7)'; ctx.lineWidth = 8; ctx.strokeRect(4, 4, W - 8, H - 8);
+  }
+  if (state === 'menu') drawMenu();
+  else {
+    drawHUD();
+    if (state === 'pause') { panel(280, 130); text('ПАУЗА', 335, 'bold 32px Segoe UI'); text('P или пробел — продолжить', 375, '15px Segoe UI', '#d8f3f0'); }
+    if (state === 'over') drawOver();
+  }
+}
+
+// ---------- Цикл ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  time += dt;
+  if (state === 'play') update(dt);
+  else if (state === 'menu') scroll += 260 * dt;
+  else if (state === 'over') overT += dt;
+  if (state !== 'pause') updateFx(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
